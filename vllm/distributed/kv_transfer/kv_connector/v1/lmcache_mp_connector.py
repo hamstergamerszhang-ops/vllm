@@ -90,6 +90,13 @@ def extract_world_size_and_kv_rank(
 ) -> tuple[int, int]:
     """
     Convert the rank for the MLA.
+
+    .. deprecated::
+        The MLA rank/world-size adjustment now lives in
+        :meth:`ParallelStrategy.kv_world_size` / ``kv_worker_id`` (computed
+        from ``use_mla``).  This helper is retained for back-compat with
+        external callers but is no longer used by the connector's adapter
+        construction (see :func:`_build_parallel_strategy`).
     """
     use_mla = mla_enabled(vllm_config.model_config)
     if not use_mla:
@@ -107,6 +114,38 @@ def extract_world_size_and_kv_rank(
         return world_size // tp_size, rank // tp_size
 
 
+def _build_parallel_strategy(vllm_config: VllmConfig) -> ParallelStrategy:
+    """Build a ``ParallelStrategy`` from a vLLM config.
+
+    Mirrors
+    ``lmcache.integration.vllm.lmcache_mp_connector.build_parallel_strategy_from_vllm_config``
+    so the vLLM-tree connector constructs the same KV-parallel geometry as
+    the LMCache-tree adapter.  The vLLM-tree connector only resolves a
+    single LMCache server URL (``lmcache.mp.host`` / ``lmcache.mp.port``),
+    so ``n_servers=1``; the strategy's ``kv_world_size`` and
+    ``kv_worker_id`` properties reproduce the old
+    :func:`extract_world_size_and_kv_rank` MLA adjustment internally, so
+    the wire ``IPCCacheServerKey`` world_size/worker_id are unchanged.
+    """
+    pc = vllm_config.parallel_config
+    dp_size = getattr(pc, "data_parallel_size", 1)
+    dp_rank = pc.rank // pc.world_size if pc.world_size > 0 else 0
+    dcp_size = getattr(pc, "decode_context_parallel_size", 1)
+    pcp_size = getattr(pc, "prefill_context_parallel_size", 1)
+    return ParallelStrategy(
+        use_mla=mla_enabled(vllm_config.model_config),
+        vllm_world_size=pc.world_size,
+        vllm_worker_id=pc.rank,
+        tp_size=pc.tensor_parallel_size,
+        pp_size=pc.pipeline_parallel_size,
+        n_servers=1,
+        dp_rank=dp_rank,
+        dp_size=dp_size,
+        dcp_size=dcp_size,
+        pcp_size=pcp_size,
+    )
+
+
 def create_scheduler_adapter(
     server_url: str,
     zmq_context: zmq.Context,
@@ -114,20 +153,7 @@ def create_scheduler_adapter(
     mq_timeout: float,
     heartbeat_interval: float,
 ) -> LMCacheMPSchedulerAdapter:
-    world_size, kv_rank = extract_world_size_and_kv_rank(
-        vllm_config.parallel_config.world_size,
-        vllm_config.parallel_config.rank,
-        vllm_config,
-    )
-    parallel_strategy = ParallelStrategy(
-        mla_enabled(vllm_config.model_config),
-        world_size,
-        kv_rank,
-        vllm_config.parallel_config.world_size,
-        vllm_config.parallel_config.rank,
-        vllm_config.parallel_config.tensor_parallel_size,
-        vllm_config.parallel_config.pipeline_parallel_size,
-    )
+    parallel_strategy = _build_parallel_strategy(vllm_config)
 
     return LMCacheMPSchedulerAdapter(
         server_url=server_url,
@@ -147,20 +173,7 @@ def create_worker_adapter(
     mq_timeout: float,
     heartbeat_interval: float,
 ) -> LMCacheMPWorkerAdapter:
-    world_size, kv_rank = extract_world_size_and_kv_rank(
-        vllm_config.parallel_config.world_size,
-        vllm_config.parallel_config.rank,
-        vllm_config,
-    )
-    parallel_strategy = ParallelStrategy(
-        mla_enabled(vllm_config.model_config),
-        world_size,
-        kv_rank,
-        vllm_config.parallel_config.world_size,
-        vllm_config.parallel_config.rank,
-        vllm_config.parallel_config.tensor_parallel_size,
-        vllm_config.parallel_config.pipeline_parallel_size,
-    )
+    parallel_strategy = _build_parallel_strategy(vllm_config)
 
     return LMCacheMPWorkerAdapter(
         server_url=server_url,
@@ -638,12 +651,13 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
-        # In MLA scenario, only the first rank of the pipeline group
-        # needs to save the KV cache.
-        if (
-            self.worker_adapter.use_mla
-            and not self.worker_adapter.is_first_rank_of_pp_group
-        ):
+        # In MLA scenario, only one rank per (server, pipeline-stage) needs
+        # to save the KV cache.  ``is_kv_writer`` selects exactly that rank
+        # (the first TP-local rank within each server block); all other MLA
+        # ranks share the same KV object and must skip the store to avoid
+        # double-writes.  Renamed from ``is_first_rank_of_pp_group`` to
+        # match the LMCache-tree adapter.
+        if self.worker_adapter.use_mla and not self.worker_adapter.is_kv_writer:
             return
 
         metadata = self._get_connector_metadata()
